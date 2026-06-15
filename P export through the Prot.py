@@ -1,153 +1,135 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.cm import ScalarMappable
 
-# ==============================================================
-# 1. Load and preprocess FORCE tectonic data
-# ==============================================================
+# ========== 1. Load data ========== #
 
-data = pd.read_excel('C:/Users/86152/Desktop/force.xlsx')
-subset = data[(data['Time (Ma)'] >= 540) & (data['Time (Ma)'] <= 1799)].copy()
-time = subset['Time (Ma)'].values.astype(np.float64)
+data    = pd.read_excel('C:/Users/86152/Desktop/force.xlsx')   # Your file location
+subset  = data[(data['Time (Ma)'] >= 540) & (data['Time (Ma)'] <= 1799)]
 
-ridge_length = subset['Mid-ocean ridge length (km)'].values
-spreading_rate = subset['Spreading rate mean (cm/yr)'].values
-crustal_prod_area = subset['Crustal production (km2/yr)'].values     # MOR source
-subduction_length = subset['Subduction zone length (km)'].values     # Arc source
-convergence_rate = subset['Convergence velocity mean (cm/yr)'].values
-crustal_destr_area = subset['Crustal destruction  rates (km2/yr)'].values  # Arc source
-cont_arc_length = subset['Continental arc length (mean) (km)'].values
+time       = subset['Time (Ma)'].values.astype(float)
+crust_prod = subset['Crustal production (km2/yr)'].values
+crust_dest = subset['Crustal destruction  rates (km2/yr)'].values
+sub_len    = subset['Subduction zone length (km)'].values
+arc_len    = subset['Continental arc length (mean) (km)'].values
 
-# ==============================================================
-# 2. Monte Carlo parameter settings
-# ==============================================================
+# ========== 2. Fixed parameters ========== #
 
-N = 10000  # Monte Carlo samples per timestep (adjustable)
+N                = 100000
+rho_crust        = 3300.0        # kg/m³
+basalt_thickness = 7.0           # km
+w_mol_P2O5       = 141.94        # g/mol
+p2o5_weight_fraction = 0.005     # 0.5 wt% P2O5 in fresh basalt
+c_fixed          = 0.9           # Fraction of P fixed in seafloor
+eps              = 1e-10
 
-density = 3300  # kg/m³ (consistent with first Monte Carlo model)
-basalt_thickness = 7.0  # km
-epsilon = 1e-10  # avoids log10 underflow
+# ========== 3. Stochastic parameter ranges ========== #
 
-# Parameter distributions
-P2O5_loss_frac_dist = (0.002, 0.006)
-palagonite_frac_dist = (0.6, 1.0)
-alt_depth_dist = (1.0, 2.0)   # km, equivalent to 1000–2000 m
-hyalo_frac_dist = (0.2, 0.8)
+params = {
+    "Lp2o5":  (0.002, 0.006),   # P2O5 leaching fraction during alteration
+    "P_alt":  (0.6,   1.0),     # Fraction of basalt undergoing alteration
+    "depth":  (1.0,   2.0),     # Alteration depth (km)
+    "hyalo":  (0.2,   0.8),     # Hyaloclastite fraction
+    "Hs":     (0.5,   0.8),     # Hydration degree – subduction
+    "Hd":     (0.1,   0.2),     # Hydration degree – MOR
+    "phi_s":  (0.12,  0.3),     # Porosity – subduction basalt
+    "phi_d":  (0.08,  0.12),    # Porosity – MOR basalt
+}
 
-# MOR vs Subduction-zone alteration parameters
-Hs_dist    = (0.5, 0.8)    # subduction-zone effective alteration fraction
-Hd_dist    = (0.1, 0.2)    # MOR effective alteration fraction
-phi_s_dist = (0.12, 0.3)   # subduction-zone porosity
-phi_d_dist = (0.08, 0.12)  # MOR porosity
+HDI_probs = {"10": 0.10, "30": 0.30, "50": 0.50, "70": 0.70, "90": 0.90}
 
-# Fraction of dissolved P fixed near the water–rock interface
-c_fixed_value = 0.9
+# ========== 4. Storage arrays ========== #
 
-# ==============================================================
-# 3. Storage arrays
-# ==============================================================
+n_t     = len(time)
+median  = np.zeros(n_t)
+HDI_low  = {k: np.zeros(n_t) for k in HDI_probs}
+HDI_high = {k: np.zeros(n_t) for k in HDI_probs}
 
-def init_array():
-    return np.zeros_like(time, dtype=np.float64)
+# ========== 5. Functions ========== #
 
-F_P_total = init_array()
-F_P_total_low = init_array()
-F_P_total_high = init_array()
+def compute_hdi(samples, prob):
+    """Return the shortest interval covering `prob` of the sorted samples."""
+    x      = np.sort(samples)
+    n      = len(x)
+    window = int(np.floor(prob * n))
+    widths = x[window:] - x[:n - window]
+    idx    = np.argmin(widths)
+    return x[idx], x[idx + window]
 
-P_total_all = np.zeros((len(time), N), dtype=np.float64)
+def safe_log10(x):
+    return np.log10(np.maximum(x, eps))
 
-# ==============================================================
-# 4. Monte Carlo simulation
-# ==============================================================
+# ========== 6. Monte Carlo ========== #
 
-for i in range(len(time)):
+rng = np.random.default_rng(42)
 
-    # ---- Random sampling of alteration parameters ----
-    alt_depth_samples = np.random.uniform(*alt_depth_dist, N)
-    hyalo_frac_samples = np.random.uniform(*hyalo_frac_dist, N)
-    palag_frac_samples = np.random.uniform(*palagonite_frac_dist, N)
-    P_loss_samples = np.random.uniform(*P2O5_loss_frac_dist, N)
+for i in range(n_t):
 
-    # MOR vs Subduction parameters
-    Hs_samples    = np.random.uniform(*Hs_dist, N)
-    Hd_samples    = np.random.uniform(*Hd_dist, N)
-    phi_s_samples = np.random.uniform(*phi_s_dist, N)
-    phi_d_samples = np.random.uniform(*phi_d_dist, N)
+    samp = {k: rng.uniform(*v, N) for k, v in params.items()}
 
-    # P retention fraction
-    fix_frac_samples = np.full(N, c_fixed_value)
+    # -- MOR contribution --
+    vol_MOR  = crust_prod[i] * samp["depth"] * samp["hyalo"] * samp["Hd"]
+    mass_MOR = vol_MOR * (1 - samp["phi_d"]) * 1e9 * rho_crust   # kg/yr
 
-    # ---- MOR basalt volume (km³/yr) ----
-    vol_basalt_MOR = crustal_prod_area[i] * alt_depth_samples * hyalo_frac_samples
-    vol_basalt_MOR_eff = vol_basalt_MOR * Hd_samples
+    # -- Subduction-arc contribution --
+    frac     = max(0, (sub_len[i] - arc_len[i]) / sub_len[i]) if sub_len[i] > 0 else 0
+    vol_arc  = 0.2 * crust_dest[i] * basalt_thickness * frac
+    vol_arc *= samp["hyalo"] * samp["Hs"]
+    mass_arc = vol_arc * (1 - samp["phi_s"]) * 1e9 * rho_crust   # kg/yr
 
-    # ---- Subduction/arc basalt volume ----
-    if subduction_length[i] > 0:
-        frac_oceanic_arc = max(0, (subduction_length[i] - cont_arc_length[i]) / subduction_length[i])
-    else:
-        frac_oceanic_arc = 0
+    # -- P flux (mol/yr) --
+    P_MOR = mass_MOR * samp["P_alt"] * samp["Lp2o5"]
+    P_arc = mass_arc * samp["P_alt"] * samp["Lp2o5"]
 
-    vol_basalt_arc = 0.2 * crustal_destr_area[i] * basalt_thickness * frac_oceanic_arc
-    vol_basalt_arc *= hyalo_frac_samples
-    vol_basalt_arc_eff = vol_basalt_arc * Hs_samples
+    mol  = (P_MOR + P_arc) * 1000 / w_mol_P2O5 * 2   # P2O5 → mol P
+    mol *= (1 - c_fixed)
 
-    # ---- Convert volume → mass (kg/yr) ----
-    mass_basalt_MOR = vol_basalt_MOR_eff * (1 - phi_d_samples) * 1e9 * density
-    mass_basalt_arc = vol_basalt_arc_eff * (1 - phi_s_samples) * 1e9 * density
+    logP = safe_log10(mol)
 
-    # ---- P2O5 mass ----
-    P2O5_mass_MOR = mass_basalt_MOR * palag_frac_samples * P_loss_samples
-    P2O5_mass_arc = mass_basalt_arc * palag_frac_samples * P_loss_samples
+    median[i] = np.median(logP)
+    for k, p in HDI_probs.items():
+        HDI_low[k][i], HDI_high[k][i] = compute_hdi(logP, p)
 
-    # ---- Convert P2O5 → P (mol/yr) ----
-    moles_P_MOR = P2O5_mass_MOR * 1000.0 / 141.94 * 2.0
-    moles_P_arc = P2O5_mass_arc * 1000.0 / 141.94 * 2.0
+# ========== 7. Plot ========== #
 
-    # ---- P released to seawater ----
-    moles_P_total = (moles_P_MOR + moles_P_arc) * (1 - fix_frac_samples)
+HDI_colors = {
+    "90": "#c6dbef",
+    "70": "#9ecae1",
+    "50": "#6baed6",
+    "30": "#3182bd",
+    "10": "#08519c",
+}
 
-    def safe_log10(x):
-        return np.log10(np.maximum(x, epsilon))
+fig, ax = plt.subplots(figsize=(10, 6))
 
-    F_P_total[i] = safe_log10(np.median(moles_P_total))
-    F_P_total_low[i] = safe_log10(np.percentile(moles_P_total, 2.5))
-    F_P_total_high[i] = safe_log10(np.percentile(moles_P_total, 97.5))
-    P_total_all[i, :] = safe_log10(moles_P_total)
+for level in ["90", "70", "50", "30", "10"]:
+    ax.fill_between(time, HDI_low[level], HDI_high[level],
+                    color=HDI_colors[level], linewidth=0)
 
-# ==============================================================
-# 5. Plot density heatmap
-# ==============================================================
+ax.plot(time, median, color='crimson', lw=2.0, label='Median P flux')
 
-logP_bins = np.linspace(8, 12, 200)
-Z = np.zeros((len(logP_bins) - 1, len(time)))
-
-for i in range(len(time)):
-    hist, _ = np.histogram(P_total_all[i, :], bins=logP_bins, density=True)
-    Z[:, i] = hist
-
-fig, ax = plt.subplots(figsize=(9, 6))
-X, Y = np.meshgrid(time, logP_bins[:-1])
-
-c = ax.pcolormesh(
-    X, Y, Z,
-    shading='auto',
-    cmap='Blues',
-    norm=Normalize(vmin=0, vmax=np.max(Z))
-)
-
-ax.plot(time, F_P_total, color='crimson', lw=2, label='Median P flux')
-ax.axhline(np.log10(2.8e10), color='gray', linestyle='--', linewidth=1)
-ax.text(time.max(), np.log10(2.8e10) + 0.1,
-        'Modern river flux',
-        color='gray', fontsize=9, ha='right', va='bottom')
+# -- Modern river flux reference line --
+modern_flux_log = np.log10(2.8e10)
+ax.axhline(modern_flux_log, color='gray', linestyle='--', linewidth=1.0)
+ax.text(time.max(), modern_flux_log + 0.08,
+        'Modern river flux', color='gray', fontsize=9, ha='right')
 
 ax.invert_xaxis()
 ax.set_xlabel('Time (Ma)')
-ax.set_ylabel('log10(P flux) [mol/yr]')
-ax.set_title('Density plot of simulated submarine total P flux (1800–540 Ma)')
-fig.colorbar(c, ax=ax, label='Probability density')
+ax.set_ylabel('log$_{10}$(P flux)  [mol yr$^{-1}$]')
+ax.set_title('Highest-density probability intervals (HDI) of submarine P flux')
+ax.legend(frameon=False, loc='upper left')
+
+# -- Colorbar --
+cmap = ListedColormap(['white'] + [HDI_colors[k] for k in ["90", "70", "50", "30", "10"]])
+norm = BoundaryNorm(np.arange(-0.5, 6), cmap.N)
+sm   = ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+
+cbar = fig.colorbar(sm, ax=ax, ticks=range(6))
+cbar.ax.set_yticklabels(['Outside', '90% HDI', '70% HDI', '50% HDI', '30% HDI', '10% HDI'])
 
 plt.tight_layout()
-plt.savefig("C:/Users/86152/Desktop/model_density_heatmap.pdf", dpi=300)
 plt.show()
